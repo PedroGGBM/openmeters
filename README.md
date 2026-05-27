@@ -79,6 +79,19 @@ pull request!
     - [x] Based on frequency
     - [x] Based on Loudness
     - [x] A single static color.
+- [x] **3D waterfall spectrogram**
+  - [x] Renders the frequency spectrum as a perspective 3D "ridge" landscape —
+        each new FFT frame becomes a glowing ridge that recedes into depth as time passes.
+  - [x] 256 log-spaced frequency bins (20 Hz – 20 kHz) give even visual weight to every
+        octave, matching how music is perceived.
+  - [x] Each ridge is filled from its floor with an amplitude-mapped heat-map color
+        (transparent void → deep indigo → magenta → amber → near-white peak), with a
+        brighter glowing outline along the ridge top for a neon-on-dark aesthetic.
+  - [x] Older frames fade and compress toward a vanishing point via perspective
+        foreshortening; the depth effect is fully adjustable (flat 2D scroll ↔ dramatic 3D).
+  - [x] Optional spectral tilt (+0–9 dB/octave) compensates for pink-noise roll-off and
+        makes high-frequency content more visible in music.
+  - [x] Adjustable noise floor and color map.
 - [x] **chromagram**
   - [x] Displays the energy distribution across the 12 pitch classes of
         Western music (C, C#, D, D#, E, F, F#, G, G#, A, A#, B),

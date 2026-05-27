@@ -169,6 +169,11 @@ visuals! {
                     p.update_config(cfg);
                 }
             }
+            // Sync floor/tilt to the waterfall sub-processor when in waterfall mode.
+            {
+                let state = s.borrow();
+                p.update_waterfall_style(state.style.floor_db, state.style.tilt_db);
+            }
         };
         apply(p, s, set) { visuals!(@apply_config p, set); let mut st = s.borrow_mut();
             visuals!(@apply_palette st, set, &palettes::spectrogram::COLORS);
@@ -182,13 +187,17 @@ visuals! {
             st.freq_scale = set.frequency_scale;
             st.set_floor_db(set.floor_db);
             st.set_tilt_db(set.tilt_db);
-            st.set_rotation(set.rotation); };
+            st.set_rotation(set.rotation);
+            st.display_mode = set.display_mode;
+            st.perspective = set.perspective.clamp(0.0, 1.0); };
         export(p, s) { let st = s.borrow(); let mut out = settings_cfg::SpectrogramSettings::from_config(&p.config());
             out.palette = PaletteSettings::from_state(&st.palette, &palettes::spectrogram::COLORS, &st.stop_positions, &palettes::spectrogram::DEFAULT_POSITIONS, &st.stop_spreads);
             out.piano_roll_overlay = st.piano_roll_overlay;
             out.floor_db = st.style.floor_db;
             out.tilt_db = st.style.tilt_db;
-            out.rotation = st.rotation; out };
+            out.rotation = st.rotation;
+            out.display_mode = st.display_mode;
+            out.perspective = st.perspective; out };
 
     Spectrum("Spectrum analyzer", 400.0, 180.0, 400.0) =>
         spectrum::SpectrumProcessor, SpectrumConfig, SpectrumState;
@@ -248,6 +257,7 @@ visuals! {
             out.palette = visuals!(@export_palette &st.palette, &palettes::chroma::COLORS);
             out
         };
+
 }
 
 struct Visual<P, S> {

@@ -1,15 +1,20 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Maika Namuo
 
+#[path = "waterfall_render.rs"]
+pub(crate) mod waterfall_render;
+
 use super::processor::{
     MAX_SPECTROGRAM_HISTORY_COLUMNS, SPECTROGRAM_HISTORY_BYTE_BUDGET, SpectrogramColumn,
-    SpectrogramConfig, SpectrogramUpdate,
+    SpectrogramConfig, SpectrogramUpdate, WaterfallFrame,
 };
 use super::render::{
     ColumnKind, PendingUpload, RingCopyPlan, SPECTROGRAM_PALETTE_SIZE, SpectrogramParams,
     SpectrogramPrimitive, col_byte_stride,
 };
-use crate::visuals::options::PianoRollOverlay;
+use self::waterfall_render::{WaterfallParams, WaterfallPrimitive};
+use crate::visuals::options::{PianoRollOverlay, SpectrogramDisplayMode};
+use crate::visuals::spectrogram::processor::waterfall_mode::{WATERFALL_FREQ_MAX, WATERFALL_FREQ_MIN};
 use crate::ui::theme::BORDER_SUBTLE;
 use crate::ui::widgets::scroll_delta_lines;
 use crate::util::audio::musical::{MusicalNote, NoteInfo};
@@ -96,6 +101,12 @@ pub(crate) struct SpectrogramState {
     col_count: u32,
     pending: VecDeque<PendingUpload>,
     pending_copy: Option<RingCopyPlan>,
+    // --- Waterfall rendering mode ---
+    pub(crate) display_mode: SpectrogramDisplayMode,
+    /// Perspective depth: 0.0 = flat scroll, 1.0 = full 3D.
+    pub(crate) perspective: f32,
+    waterfall_ring: VecDeque<WaterfallFrame>,
+    waterfall_num_bins: usize,
 }
 
 impl SpectrogramState {
@@ -124,6 +135,10 @@ impl SpectrogramState {
             col_count: 0,
             pending: VecDeque::new(),
             pending_copy: None,
+            display_mode: SpectrogramDisplayMode::Spectrogram,
+            perspective: 0.7,
+            waterfall_ring: VecDeque::new(),
+            waterfall_num_bins: 0,
         }
     }
 
@@ -160,6 +175,58 @@ impl SpectrogramState {
         self.rotation = rotation.clamp(-1, 2);
     }
 
+    // ---- helpers that adapt to the active display mode ----
+
+    /// Frequency scale used for piano roll and tooltip overlays.
+    fn effective_freq_scale(&self) -> FrequencyScale {
+        match self.display_mode {
+            SpectrogramDisplayMode::Waterfall => FrequencyScale::Logarithmic,
+            _ => self.freq_scale,
+        }
+    }
+
+    /// (min_hz, max_hz) of the frequency axis for overlay rendering.
+    fn effective_display_axis(&self) -> (f32, f32) {
+        match self.display_mode {
+            SpectrogramDisplayMode::Waterfall => {
+                let nyq = (self.sample_rate / 2.0).max(1.0);
+                (WATERFALL_FREQ_MIN, WATERFALL_FREQ_MAX.min(nyq))
+            }
+            _ => display_axis(self.sample_rate),
+        }
+    }
+
+    /// Rotation index used for piano-roll / tooltip geometry.
+    /// In waterfall mode, rotation=0 means freq is horizontal, which maps to the same
+    /// logical axis as spectrogram rotation=1 (horizontal freq axis).
+    fn effective_rotation_index(&self) -> u32 {
+        let idx = self.rotation_index();
+        if self.display_mode == SpectrogramDisplayMode::Waterfall {
+            idx ^ 1 // flip LSB: 0↔1, 2↔3
+        } else {
+            idx
+        }
+    }
+
+    /// Build waterfall render params from the current ring buffer.
+    pub(crate) fn visual_params_waterfall(&self, bounds: Rectangle) -> Option<WaterfallParams> {
+        if self.waterfall_ring.is_empty() || bounds.width <= 0.0 || bounds.height <= 0.0 {
+            return None;
+        }
+        let op = self.style.opacity.clamp(0.0, 1.0);
+        let palette = self.palette.map(|c| rgba_with_alpha(color_to_rgba(c), c.a * op));
+        let rotation = (self.rotation as i32).rem_euclid(4) as u32;
+        Some(WaterfallParams {
+            bounds,
+            frames: self.waterfall_ring.iter().cloned().collect(),
+            num_bins: self.waterfall_num_bins.max(1),
+            palette,
+            perspective: self.perspective,
+            rotation,
+            key: self.key,
+        })
+    }
+
     pub fn apply_snapshot(&mut self, snap: SpectrogramUpdate) {
         if snap.new_columns.is_empty() && !snap.reset {
             return;
@@ -169,6 +236,29 @@ impl SpectrogramState {
         self.hop_size = snap.hop_size;
         self.freq_scale = snap.frequency_scale;
 
+        // Waterfall mode: simple ring buffer, no GPU texture management.
+        if self.display_mode == SpectrogramDisplayMode::Waterfall
+            || snap
+                .new_columns
+                .first()
+                .is_some_and(|c| matches!(c, SpectrogramColumn::Waterfall(_)))
+        {
+            if snap.reset {
+                self.waterfall_ring.clear();
+            }
+            let max_frames = snap.history_length.max(1);
+            self.waterfall_num_bins = snap.points_per_column.max(1);
+            for col in snap.new_columns {
+                if let SpectrogramColumn::Waterfall(frame) = col {
+                    self.waterfall_ring.push_back(frame);
+                    while self.waterfall_ring.len() > max_frames {
+                        self.waterfall_ring.pop_front();
+                    }
+                }
+            }
+            return;
+        }
+
         let ppc = snap.points_per_column;
         if ppc == 0 {
             return;
@@ -176,7 +266,7 @@ impl SpectrogramState {
         let new_kind = match snap.new_columns.first() {
             Some(SpectrogramColumn::Reassigned(_)) => ColumnKind::Reassigned,
             Some(SpectrogramColumn::Classic(_)) => ColumnKind::Classic,
-            None => self.col_kind,
+            Some(SpectrogramColumn::Waterfall(_)) | None => self.col_kind,
         };
         let max_bytes = SPECTROGRAM_HISTORY_BYTE_BUDGET as u64
             * (1 + u64::from(new_kind == ColumnKind::Reassigned));
@@ -222,6 +312,7 @@ impl SpectrogramState {
                     slot: self.write_slot,
                     mags,
                 },
+                SpectrogramColumn::Waterfall(_) => continue,
             };
             if self.pending.len() as u32 >= self.ring_capacity {
                 self.pending.pop_front();
@@ -310,8 +401,8 @@ impl SpectrogramState {
         if self.fft_size == 0 || self.sample_rate <= 0.0 {
             return None;
         }
-        let (min_f, nyq) = display_axis(self.sample_rate);
-        let freq = self.freq_scale.freq_at(min_f, nyq, tex_uv);
+        let (min_f, nyq) = self.effective_display_axis();
+        let freq = self.effective_freq_scale().freq_at(min_f, nyq, tex_uv);
         (freq.is_finite() && freq > 0.0).then_some(freq)
     }
 
@@ -321,7 +412,7 @@ impl SpectrogramState {
     }
 
     fn freq_axis_is_horizontal(&self) -> bool {
-        matches!(self.rotation_index(), 1 | 3)
+        matches!(self.effective_rotation_index(), 1 | 3)
     }
 
     // Maps a screen point to the frequency-axis UV (0..1), matching
@@ -330,7 +421,7 @@ impl SpectrogramState {
         if !bounds.contains(cursor) {
             return None;
         }
-        let norm = match self.rotation_index() {
+        let norm = match self.effective_rotation_index() {
             1 => (cursor.x - bounds.x) / bounds.width,
             2 => (cursor.y - bounds.y) / bounds.height,
             3 => 1.0 - (cursor.x - bounds.x) / bounds.width,
@@ -509,8 +600,8 @@ impl<'a> Spectrogram<'a> {
         if state.fft_size == 0 || state.sample_rate <= 0.0 {
             return;
         }
-        let (min_f, nyq) = display_axis(state.sample_rate);
-        let (scale, rot) = (state.freq_scale, state.rotation_index());
+        let (min_f, nyq) = state.effective_display_axis();
+        let (scale, rot) = (state.effective_freq_scale(), state.effective_rotation_index());
         drop(state);
         let horizontal = matches!(rot, 1 | 3);
 
@@ -740,9 +831,21 @@ impl<'a, Message> Widget<Message, iced::Theme, iced::Renderer> for Spectrogram<'
         _: &Rectangle,
     ) {
         let bounds = layout.bounds();
-        let (uv_y_range, piano_roll, bg, params);
+        let interaction = tree.state.downcast_ref::<InteractionState>();
+
+        // ---- shared state reads + waterfall-rotation fixup ----
+        let display_mode;
+        let piano_roll;
+        let bg;
+        let original_rotation;
+        let uv_y_range;
+        let spectrogram_params;
+        let waterfall_params;
+
         {
             let mut state = self.state.borrow_mut();
+            display_mode = state.display_mode;
+
             let (bw, bh) = (
                 bounds.width.round().max(1.0) as u32,
                 bounds.height.round().max(1.0) as u32,
@@ -752,29 +855,69 @@ impl<'a, Message> Widget<Message, iced::Theme, iced::Renderer> for Spectrogram<'
             } else {
                 bw
             };
-            uv_y_range = state.uv_y_range();
+
             piano_roll = state.piano_roll_overlay;
             bg = state.style.background;
-            params = state.visual_params(bounds, uv_y_range);
+            original_rotation = state.rotation;
+
+            if display_mode == SpectrogramDisplayMode::Waterfall {
+                // Temporarily expose the effective rotation for piano-roll/tooltip
+                // (waterfall rotation=0 uses horizontal freq → same as spectrogram rot=1).
+                let eff_rot = (original_rotation as i32).rem_euclid(4) as u32 ^ 1;
+                state.rotation = eff_rot as i8;
+                uv_y_range = [0.0_f32, 1.0];
+                waterfall_params = state.visual_params_waterfall(bounds);
+                spectrogram_params = None;
+            } else {
+                uv_y_range = state.uv_y_range();
+                spectrogram_params = state.visual_params(bounds, uv_y_range);
+                waterfall_params = None;
+            }
+            // borrow_mut released; state.rotation carries effective value for overlays
         }
-        let interaction = tree.state.downcast_ref::<InteractionState>();
+
         fill_rect(renderer, bounds, bg);
-        if let Some(p) = params {
-            renderer.draw_primitive(bounds, SpectrogramPrimitive::new(p));
-        }
-        if piano_roll != PianoRollOverlay::Off {
-            renderer.with_layer(bounds, |r| {
-                self.draw_piano_roll(r, theme, bounds, piano_roll, uv_y_range);
-            });
-        }
-        if interaction.left_held
-            && let Some(c) = interaction.cursor
-            && bounds.contains(c)
-        {
-            renderer.with_layer(bounds, |r| {
-                Self::draw_crosshair(r, bounds, c);
-                self.draw_tooltip(r, theme, bounds, c, uv_y_range);
-            });
+
+        if display_mode == SpectrogramDisplayMode::Waterfall {
+            // ---- 3D waterfall render ----
+            if let Some(p) = waterfall_params {
+                renderer.draw_primitive(bounds, WaterfallPrimitive::new(p));
+            }
+            if piano_roll != PianoRollOverlay::Off {
+                renderer.with_layer(bounds, |r| {
+                    self.draw_piano_roll(r, theme, bounds, piano_roll, uv_y_range);
+                });
+            }
+            if interaction.left_held
+                && let Some(c) = interaction.cursor
+                && bounds.contains(c)
+            {
+                renderer.with_layer(bounds, |r| {
+                    Self::draw_crosshair(r, bounds, c);
+                    self.draw_tooltip(r, theme, bounds, c, uv_y_range);
+                });
+            }
+            // Restore original rotation (draw_* above saw the effective value).
+            self.state.borrow_mut().rotation = original_rotation;
+        } else {
+            // ---- classic / reassigned spectrogram render ----
+            if let Some(p) = spectrogram_params {
+                renderer.draw_primitive(bounds, SpectrogramPrimitive::new(p));
+            }
+            if piano_roll != PianoRollOverlay::Off {
+                renderer.with_layer(bounds, |r| {
+                    self.draw_piano_roll(r, theme, bounds, piano_roll, uv_y_range);
+                });
+            }
+            if interaction.left_held
+                && let Some(c) = interaction.cursor
+                && bounds.contains(c)
+            {
+                renderer.with_layer(bounds, |r| {
+                    Self::draw_crosshair(r, bounds, c);
+                    self.draw_tooltip(r, theme, bounds, c, uv_y_range);
+                });
+            }
         }
     }
 

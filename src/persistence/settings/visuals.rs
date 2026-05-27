@@ -5,8 +5,9 @@ use super::palette::{HasPalette, PaletteSettings};
 use crate::domain::visuals::VisualKind;
 use crate::util::audio::{Channel, FrequencyScale, WindowKind};
 use crate::visuals::options::{
-    CorrelationMeterMode, CorrelationMeterSide, MeterMode, PianoRollOverlay, SpectrumDisplayMode,
-    SpectrumWeightingMode, StereometerMode, StereometerScale, WaveformColorMode,
+    CorrelationMeterMode, CorrelationMeterSide, MeterMode, PianoRollOverlay,
+    SpectrogramDisplayMode, SpectrumDisplayMode, SpectrumWeightingMode, StereometerMode,
+    StereometerScale, WaveformColorMode,
 };
 use crate::visuals::{
     chroma::processor::ChromaConfig,
@@ -171,11 +172,13 @@ visual_settings!(SpectrogramSettings from SpectrogramConfig {
     fft_size: usize, hop_size: usize, window: WindowKind, frequency_scale: FrequencyScale,
     use_reassignment: bool,
     zero_padding_factor: usize,
+    display_mode: SpectrogramDisplayMode,
 } extra {
     floor_db: f32 = -96.0,
     tilt_db: f32 = 0.0,
     piano_roll_overlay: PianoRollOverlay = PianoRollOverlay::default(),
-    rotation: i8 = 0,
+    rotation: i8 = 1,
+    perspective: f32 = 0.7,
 });
 
 visual_settings!(StereometerSettings from StereometerConfig {
@@ -199,3 +202,4 @@ visual_settings!(ChromaSettings from ChromaConfig {
 } extra {
     show_peak_hold: bool = true,
 });
+

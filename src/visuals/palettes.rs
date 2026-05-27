@@ -208,6 +208,7 @@ pub mod background {
     pub const DEFAULT_POSITIONS: [f32; COLORS.len()] = [0.0];
 }
 
+
 // Chromagram: 12 pitch-class colors (C–B) + 1 peak-hold color
 pub mod chroma {
     use super::{Color, hex};

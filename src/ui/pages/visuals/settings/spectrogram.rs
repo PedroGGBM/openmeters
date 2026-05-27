@@ -7,7 +7,7 @@ use super::widgets::{
 };
 use crate::persistence::settings::SpectrogramSettings;
 use crate::util::audio::{FrequencyScale, WindowKind};
-use crate::visuals::options::PianoRollOverlay;
+use crate::visuals::options::{PianoRollOverlay, SpectrogramDisplayMode};
 use crate::visuals::registry::VisualKind;
 use iced::widget::{column, row};
 use iced::{Element, Length};
@@ -16,6 +16,7 @@ const ZERO_PAD_OPTIONS: [usize; 6] = [1, 2, 4, 8, 16, 32];
 const FLOOR_DB_RANGE: SliderRange = SliderRange::new(-140.0, -1.0, 1.0);
 const TILT_DB_RANGE: SliderRange = SliderRange::new(-6.0, 6.0, 0.5);
 const ROTATION_RANGE: SliderRange = SliderRange::new(-1.0, 2.0, 1.0);
+const PERSPECTIVE_RANGE: SliderRange = SliderRange::new(0.0, 1.0, 0.01);
 
 settings_pane!(
     SpectrogramSettingsPane, SpectrogramSettings, VisualKind::Spectrogram, Spectrogram,
@@ -39,11 +40,14 @@ settings_messages!(SpectrogramSettingsPane as pane, value {
     );
     ZeroPadding(usize) => set_if_changed(&mut pane.settings.zero_padding_factor, value);
     PianoRoll(PianoRollOverlay) => set_if_changed(&mut pane.settings.piano_roll_overlay, value);
+    DisplayMode(SpectrogramDisplayMode) => set_if_changed(&mut pane.settings.display_mode, value);
+    Perspective(f32) => update_f32_range(&mut pane.settings.perspective, value, PERSPECTIVE_RANGE);
 });
 
 impl SpectrogramSettingsPane {
     fn view(&self) -> Element<'_, Message> {
         let s = &self.settings;
+        let is_waterfall = s.display_mode == SpectrogramDisplayMode::Waterfall;
         let hop_divisor = get_closest_hop_divisor(s.fft_size, s.hop_size);
         let left = controls!(8.0;
             pick("FFT size", &FFT_OPTIONS, s.fft_size, Message::FftSize);
@@ -56,7 +60,7 @@ impl SpectrogramSettingsPane {
         .width(Length::Fill);
         let right = controls!(8.0;
             pick("Window", WindowKind::ALL, s.window, Message::Window);
-            pick("Freq scale", FrequencyScale::ALL, s.frequency_scale, Message::FrequencyScale);
+            pick("Display mode", SpectrogramDisplayMode::ALL, s.display_mode, Message::DisplayMode);
             pick("Zero pad", &ZERO_PAD_OPTIONS, s.zero_padding_factor, Message::ZeroPadding);
         )
         .width(Length::Fill);
@@ -65,7 +69,7 @@ impl SpectrogramSettingsPane {
         } else {
             format!("{:+.1} dB/dec", s.tilt_db)
         };
-        let core = controls!(
+        let mut core = controls!(
             iced::widget::Column::new()
                 .spacing(8.0)
                 .push(row![left, right].spacing(10).width(Length::Fill));
@@ -76,18 +80,42 @@ impl SpectrogramSettingsPane {
                 format!("{}\u{00b0}", s.rotation as i32 * 90)
             );
         );
-        let advanced = controls!(8.0;
-            toggle("Time-frequency reassignment", s.use_reassignment, Message::UseReassignment);
-        );
-
-        column![
+        if is_waterfall {
+            core = core.push(slider!(
+                "Perspective",
+                s.perspective,
+                PERSPECTIVE_RANGE,
+                Message::Perspective,
+                format!("{:.0}%", s.perspective * 100.0)
+            ));
+        }
+        let mut layout = column![
             section("Core controls"),
             core,
-            section("Advanced"),
-            advanced,
-            super::palette_section(&self.palette, Message::Palette)
         ]
-        .spacing(16)
-        .into()
+        .spacing(16);
+
+        if !is_waterfall {
+            let advanced = controls!(8.0;
+                pick(
+                    "Freq scale",
+                    FrequencyScale::ALL,
+                    s.frequency_scale,
+                    Message::FrequencyScale,
+                );
+                toggle(
+                    "Time-frequency reassignment",
+                    s.use_reassignment,
+                    Message::UseReassignment,
+                );
+            );
+            layout = layout
+                .push(section("Advanced"))
+                .push(advanced);
+        }
+
+        layout
+            .push(super::palette_section(&self.palette, Message::Palette))
+            .into()
     }
 }

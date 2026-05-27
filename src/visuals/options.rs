@@ -31,5 +31,9 @@ impl MeterMode {
 }
 
 crate::macros::choice_enum!(all pub enum SpectrumDisplayMode { #[default] Line => "Line", Bar => "Bar" });
+crate::macros::choice_enum!(all pub enum SpectrogramDisplayMode {
+    #[default] Spectrogram => "Spectrogram",
+    Waterfall => "Waterfall (3D)",
+});
 crate::macros::choice_enum!(all pub enum SpectrumWeightingMode { #[default] AWeighted => "A-Weighted", Raw => "Raw" });
 crate::macros::choice_enum!(all pub enum WaveformColorMode { #[default] Frequency => "Frequency", Loudness => "Loudness", Static => "Static" });

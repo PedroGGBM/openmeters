@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 // Copyright (C) 2026 Maika Namuo
 
+#[path = "waterfall_mode.rs"]
+pub(crate) mod waterfall_mode;
+pub(crate) use waterfall_mode::{WATERFALL_NUM_BINS, WaterfallFrame};
+
 // Spectrogram DSP - Time-frequency analysis with reassignment
 //
 // # References
@@ -22,6 +26,7 @@
 //    JASA, vol. 110, no. 5, pp. 2575-2592, Nov 2001.
 
 use crate::dsp::AudioBlock;
+use crate::visuals::options::SpectrogramDisplayMode;
 use crate::util::audio::{
     DB_FLOOR, DEFAULT_SAMPLE_RATE, FrequencyScale, LN_TO_DB, WindowKind,
     compute_fft_bin_normalization, copy_dc_removed_from_deque, db_to_power, mixdown_into_deque,
@@ -59,6 +64,8 @@ pub struct SpectrogramConfig {
     pub history_length: usize,
     pub use_reassignment: bool,
     pub zero_padding_factor: usize,
+    /// Switches the rendering path: classic/reassigned 2D or 3D waterfall.
+    pub display_mode: SpectrogramDisplayMode,
 }
 
 const DEFAULT_SPECTROGRAM_FFT_SIZE: usize = 2048;
@@ -84,6 +91,7 @@ impl Default for SpectrogramConfig {
             history_length: 0,
             use_reassignment: true,
             zero_padding_factor: 1,
+            display_mode: SpectrogramDisplayMode::Spectrogram,
         }
     }
 }
@@ -137,10 +145,12 @@ impl ReassignmentBuffers {
 // Reassigned ships fractional (t, f, mag) per bin for splat rendering.
 // Classic ships packed fixed-domain dB per bin; freq is implicit (k * bin_hz)
 // and the renderer fills between adjacent bins.
+// Waterfall ships one normalized frame of WATERFALL_NUM_BINS [0..1] values.
 #[derive(Debug, Clone)]
 pub enum SpectrogramColumn {
     Reassigned(Vec<SpectrogramPoint>),
     Classic(Vec<u16>),
+    Waterfall(WaterfallFrame),
 }
 
 #[derive(Debug, Clone)]
@@ -174,6 +184,8 @@ pub struct SpectrogramProcessor {
     audio_buffer: VecDeque<f32>,
     bin_hz: f32,
     reset: bool,
+    /// Active only when `config.display_mode == Waterfall`.
+    waterfall_proc: Option<Box<waterfall_mode::WaterfallSubProc>>,
 }
 
 impl SpectrogramProcessor {
@@ -200,8 +212,16 @@ impl SpectrogramProcessor {
             audio_buffer: VecDeque::new(),
             bin_hz: 0.0,
             reset: true,
+            waterfall_proc: None,
         };
         processor.rebuild_fft();
+        if cfg.display_mode == SpectrogramDisplayMode::Waterfall {
+            processor.waterfall_proc = Some(Box::new(waterfall_mode::WaterfallSubProc::new(
+                processor.fft_size,
+                cfg.hop_size,
+                cfg.sample_rate,
+            )));
+        }
         processor
     }
 
@@ -432,8 +452,34 @@ impl SpectrogramProcessor {
             self.config.sample_rate = sample_rate;
             self.rebuild_fft();
             self.audio_buffer.clear();
+            if let Some(wf) = &mut self.waterfall_proc {
+                wf.rebuild_if_needed(self.fft_size, self.config.hop_size, sample_rate);
+            }
             self.reset = true;
         }
+
+        // Waterfall mode: bypass spectrogram DSP entirely, run the sub-processor.
+        if self.config.display_mode == SpectrogramDisplayMode::Waterfall {
+            if let Some(wf) = &mut self.waterfall_proc {
+                wf.feed(block.samples, block.channels.max(1));
+                let frames = wf.drain_frames();
+                if frames.is_empty() {
+                    return None;
+                }
+                return Some(SpectrogramUpdate {
+                    fft_size: self.fft_size,
+                    hop_size: self.config.hop_size,
+                    sample_rate: self.config.sample_rate,
+                    frequency_scale: self.config.frequency_scale,
+                    history_length: self.config.history_length,
+                    reset: std::mem::take(&mut self.reset),
+                    points_per_column: WATERFALL_NUM_BINS,
+                    new_columns: frames.into_iter().map(SpectrogramColumn::Waterfall).collect(),
+                });
+            }
+            return None;
+        }
+
         mixdown_into_deque(&mut self.audio_buffer, block.samples, block.channels);
         let cols = self.process_ready_windows();
         let bin_count = self.fft_size / 2 + 1;
@@ -450,6 +496,15 @@ impl SpectrogramProcessor {
                 points_per_column: bin_count,
                 new_columns: cols,
             })
+        }
+    }
+
+    /// Sync style-side parameters (floor dB, spectral tilt) to the waterfall sub-processor.
+    /// Called from `pre_ingest` in the registry.
+    pub fn update_waterfall_style(&mut self, floor_db: f32, tilt_db: f32) {
+        if let Some(wf) = &mut self.waterfall_proc {
+            wf.floor_db = floor_db;
+            wf.update_tilt(tilt_db);
         }
     }
 
@@ -474,6 +529,24 @@ impl SpectrogramProcessor {
         let reset = rebuild || prev.hop_size != cfg.hop_size;
         if reset {
             self.reset = true;
+        }
+
+        // Handle waterfall sub-processor lifecycle.
+        match cfg.display_mode {
+            SpectrogramDisplayMode::Waterfall => {
+                if let Some(wf) = &mut self.waterfall_proc {
+                    wf.rebuild_if_needed(self.fft_size, cfg.hop_size, cfg.sample_rate);
+                } else {
+                    self.waterfall_proc = Some(Box::new(waterfall_mode::WaterfallSubProc::new(
+                        self.fft_size,
+                        cfg.hop_size,
+                        cfg.sample_rate,
+                    )));
+                }
+            }
+            SpectrogramDisplayMode::Spectrogram => {
+                self.waterfall_proc = None;
+            }
         }
     }
 }
@@ -609,14 +682,18 @@ mod tests {
     fn classic_mags(col: &SpectrogramColumn) -> &[u16] {
         match col {
             SpectrogramColumn::Classic(v) => v,
-            SpectrogramColumn::Reassigned(_) => panic!("expected classic column"),
+            SpectrogramColumn::Reassigned(_) | SpectrogramColumn::Waterfall(_) => {
+                panic!("expected classic column")
+            }
         }
     }
 
     fn reassigned_points(col: &SpectrogramColumn) -> &[SpectrogramPoint] {
         match col {
             SpectrogramColumn::Reassigned(v) => v,
-            SpectrogramColumn::Classic(_) => panic!("expected reassigned column"),
+            SpectrogramColumn::Classic(_) | SpectrogramColumn::Waterfall(_) => {
+                panic!("expected reassigned column")
+            }
         }
     }
 
