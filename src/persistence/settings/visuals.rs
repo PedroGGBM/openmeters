@@ -192,9 +192,10 @@ visual_settings!(LoudnessSettings {
     right_mode: MeterMode = MeterMode::LufsShortTerm,
 });
 
+// Only user-visible parameters are persisted. fft_size / hop_size / min_freq_hz /
+// max_freq_hz are fixed internal constants and deliberately excluded.
 visual_settings!(ChromaSettings from ChromaConfig {
-    fft_size: usize, hop_size: usize, min_freq_hz: f32, max_freq_hz: f32,
-    smoothing: f32, floor_db: f32, peak_decay: f32,
+    smoothing: f32, floor_db: f32, peak_decay: f32, reference_hz: f32,
 } extra {
     show_peak_hold: bool = true,
 });
